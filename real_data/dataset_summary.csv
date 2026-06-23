@@ -1,0 +1,9 @@
+dataset,path,rows,columns,id_column,target_column,label_rate,label_coverage_vs_features,notes
+train_features,train/features_train.parquet,87232,180,,,,,Anonymized time-indexed transaction-count features C1..C180
+train_target,train/target_train.parquet,87232,1,,LABEL,0.200099,1.0,Target aligned by row order with train_features
+batch_features_0923_1737,batches/features/0923_1737_features.parquet,30762,181,merchant_id,,0.226767,0.969638,Has labels file: 0923_1737_Ground_Truth.parquet
+batch_labels_0923_1737,batches/labels/0923_1737_Ground_Truth.parquet,29828,2,MERCHANT_ID,LABEL,0.226767,0.969638,Ground truth for batch 0923_1737
+batch_features_1023_2038,batches/features/1023_2038_features.parquet,30817,181,merchant_id,,0.217154,0.968167,Has labels file: 1023_2038_Ground_Truth.parquet
+batch_labels_1023_2038,batches/labels/1023_2038_Ground_Truth.parquet,29836,2,MERCHANT_ID,LABEL,0.217154,0.968167,Ground truth for batch 1023_2038
+batch_features_1127_1528,batches/features/1127_1528_features.parquet,28519,181,merchant_id,,0.19017,0.976682,Has labels file: 1127_1528_Ground_Truth.parquet
+batch_labels_1127_1528,batches/labels/1127_1528_Ground_Truth.parquet,27854,2,MERCHANT_ID,LABEL,0.19017,0.976682,Ground truth for batch 1127_1528

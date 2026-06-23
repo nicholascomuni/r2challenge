@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+
+mlruns/
+mlartifacts/
+
+reports/predictions/
+reports/monitoring/
+reports/training/
+
+data/
+
+*.zip
+.DS_Store

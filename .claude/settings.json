@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(py -0)",
+      "Bash(where python3.11)",
+      "Bash(where python3.12)",
+      "Bash(py -3.11 -m venv .venv)",
+      "Bash(.venv/Scripts/python.exe --version)",
+      "Bash(.venv/Scripts/python.exe -m pip install --upgrade pip -q)",
+      "Bash(.venv/Scripts/python.exe -m pip install -r requirements.txt)",
+      "Bash(.venv/Scripts/python.exe -m pip list)",
+      "Bash(.venv/Scripts/python.exe -m pip install mlflow==2.17.2 evidently==0.4.40 streamlit==1.39.0)",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(.venv/Scripts/python.exe -m src.training.train)",
+      "Bash(.venv/Scripts/python.exe -m src.inference.batch_predict)"
+    ]
+  }
+}
