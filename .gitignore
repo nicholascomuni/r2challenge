@@ -1,15 +1,35 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
 
+# MLflow
 mlruns/
 mlartifacts/
 
+# Pipeline outputs
 reports/predictions/
 reports/monitoring/
 reports/training/
 
+# Data
 data/
+real_data/
 
+# Claude Code
+.claude/
+
+# Presentation
+presentation/
+
+# OS / tooling
 *.zip
 .DS_Store
+Thumbs.db
+.env
+

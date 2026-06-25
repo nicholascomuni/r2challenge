@@ -121,7 +121,7 @@ docker compose up -d mlflow
 
 ## Pipeline Reference
 
-All commands run from the project root with the virtual environment activated.
+All commands run from the project root using Docker Compose.
 
 ### 1 · Train
 
@@ -330,24 +330,6 @@ The brief explicitly values **interpretability over complexity** for this busine
 
 Tracking (params / metrics / artifacts) and the Model Registry are both needed by the brief, and MLflow provides both in one tool, runs entirely locally (file-based backend, no cloud dependency), and is the de-facto standard so the workflow generalizes to a real deployment.
 
-### Critical data finding: feature scale mismatch between train and batch data
-
-`features_train.parquet` is **row-wise max-normalized**: every training row's maximum feature value is exactly `1.0`. The batch feature files contain **raw, unbounded transaction counts** (values up to ~30,000). Feeding batch data to the model without correcting for this would silently produce near-meaningless probabilities, since the model only ever saw inputs in `[0, 1]` during training.
-
-`batch_predict.py`, `evaluate.py`, and `monitor.py` all apply the same row-wise max-rescaling before calling the model (see `normalize_feature_scale`). This was verified by reproducing the exact training-data normalization on a few batch rows and confirming the resulting distribution matches.
-
-### Column name normalization
-
-Batch feature files use `merchant_id`; label files use `MERCHANT_ID`. Both are normalized to `merchant_id` on load so batches, predictions, and labels join cleanly.
-
-### Loading the model: native XGBoost flavor, not pyfunc
-
-All scripts load the registered model with `mlflow.xgboost.load_model("models:/churn_model/@champion")` and call `.predict_proba()` directly. We deliberately avoid `mlflow.pyfunc.load_model(...).predict()`: for an `XGBClassifier` logged via `mlflow.xgboost.log_model`, the pyfunc wrapper's `predict()` returns **hard class labels (0/1)**, not probabilities — it silently calls `.predict()`, not `.predict_proba()`. Since the brief explicitly asks for raw churn probabilities, using pyfunc would have quietly produced wrong outputs. The model is still loaded by name and alias from the registry either way, so traceability is unaffected.
-
-### Partial label coverage
-
-Batch label files cover ~97 % of the corresponding feature rows. Performance metrics (AUC / Precision / Recall) are computed on an inner join between predictions and available labels — `label_coverage` is reported alongside the metrics so a drop in coverage is itself visible, since it could mask a deteriorating evaluation sample.
-
 ---
 
 ## Model Selection
@@ -359,29 +341,25 @@ A single XGBoost configuration was trained with commonly-used defaults (`n_estim
 
 Result on the held-out test split: **AUC ≈ 0.815, Precision ≈ 0.64, Recall ≈ 0.43**. The threshold (and possibly a cost-sensitive objective) is the natural next tuning step once the business's relative cost of a false-negative vs. false-positive loan is defined — intentionally left as a follow-up rather than guessed at here.
 
-### Observed results on the provided batches
-
-All three production batches were flagged **AMBER**, driven by an AUC drop of 0.045–0.068 (from 0.815 training AUC down to ~0.75–0.77 per batch). The consistent direction and magnitude across all three batches points to a mild, structural population shift rather than a one-off anomaly — worth monitoring, but not yet severe enough to halt scoring or force an emergency retrain. Label drift was mild (batch churn rates of 19–23 % vs. 20 % in training, PSI < 0.01 in all three batches), so the AUC drop is better explained by degraded ranking on the batch population than by a shift in the underlying churn rate.
-
 ---
 
 ## Production Architecture
 
-The POC scripts contain all the business logic that matters — feature normalization, PSI computation, release gates, status rules. Moving to production means swapping the local runtime for managed cloud services; **the logic itself does not change**.
+The POC scripts contain all the business logic that matters — feature normalization, PSI computation, release gates, status rules. Moving to production means swapping the local runtime for managed services; **the logic itself does not change**.
 
-### Target architecture (AWS)
+### Target architecture
 
 ```
                         ┌──────────────────────────────────────────────────────┐
-                        │                      AWS                              │
+                        │                   Production                          │
                         │                                                        │
-  Batch files ─────────►  S3  (data lake)                                      │
+  Batch files ─────────►  Object Storage  (data lake)                          │
   Ground truth          │   data/batches/features/                              │
                         │   data/batches/labels/                                │
                         │   data/train/                                         │
                         │        │                                              │
                         │        ▼                                              │
-                        │  Amazon MWAA  (Airflow)                              │
+                        │  Airflow                                              │
                         │  ┌─────────────────────────────────────┐             │
                         │  │  scoring_dag  (per batch arrival)   │             │
                         │  │    validate → score → monitor        │             │
@@ -393,17 +371,17 @@ The POC scripts contain all the business logic that matters — feature normaliz
                         │  └─────────────────────────────────────┘             │
                         │        │                                              │
                         │        ▼                                              │
-                        │  AWS Glue / EMR  (PySpark)                          │
-                        │  score_batch.py · monitor.py · train.py             │
+                        │  PySpark  (batch processing)                         │
+                        │  score_batch.py · monitor.py · train.py              │
                         │        │                                              │
                         │        ▼                                              │
-                        │  S3  (outputs)              MLflow Server            │
-                        │   predictions/ (Parquet)    ECS Fargate              │
-                        │   monitoring/status/ (JSON) RDS PostgreSQL           │
-                        │   monitoring/reports/ (HTML)S3 artifact store        │
+                        │  Object Storage (outputs)   MLflow Server            │
+                        │   predictions/ (Parquet)    Container Service        │
+                        │   monitoring/status/ (JSON) Relational Database      │
+                        │   monitoring/reports/ (HTML)Artifact Storage         │
                         │        │                                              │
-                        │   Athena (query layer)      CloudWatch + SNS         │
-                        │        │                    (alerts)                  │
+                        │  Data Warehouse (query layer)  Monitoring & Alerting │
+                        │        │                                              │
                         │        ▼                                              │
                         │   Dashboard  (see options below)                     │
                         └──────────────────────────────────────────────────────┘
@@ -411,12 +389,12 @@ The POC scripts contain all the business logic that matters — feature normaliz
 
 ---
 
-### Storage — S3 + Athena + RDS
+### Storage — Object Storage + Data Warehouse + Relational Database
 
-**S3** is the single source of truth for all data and outputs:
+**Object storage** is the single source of truth for all data and outputs:
 
 ```
-s3://r2-churn-model/
+data-lake/
 ├── data/
 │   ├── train/                      # features_train.parquet, target_train.parquet
 │   ├── batches/features/           # incoming batch files (partitioned by date)
@@ -424,21 +402,21 @@ s3://r2-churn-model/
 ├── predictions/                    # <batch_id>_predictions.parquet + metadata.json
 ├── monitoring/
 │   ├── status/                     # <batch_id>_status.json
-│   └── reports/                    # champion_report.html (static site, served via CloudFront)
+│   └── reports/                    # champion_report.html (served via CDN)
 └── mlflow-artifacts/               # MLflow artifact store (models, plots)
 ```
 
-**Athena** sits on top of S3 as a serverless query layer — no ETL pipeline needed. Parquet files in `predictions/` are immediately queryable for trend analysis ("what was the mean risk score and batch status over the last 90 days?"). Monitoring JSON files can be registered as an external table via AWS Glue Data Catalog. Pay-per-query, zero infrastructure to maintain.
+**Data warehouse** sits on top of object storage as a serverless query layer. Parquet files in `predictions/` are immediately queryable for trend analysis ("what was the mean risk score and batch status over the last 90 days?"). Monitoring JSON files can be catalogued for SQL access. Pay-per-query, zero infrastructure to maintain.
 
-**RDS PostgreSQL** serves as the MLflow backend store (replacing the local SQLite file). A `db.t3.micro` instance is sufficient for the experiment tracking load of this pipeline.
+**Relational database** serves as the MLflow backend store (replacing the local SQLite file). A small instance is sufficient for the experiment tracking load of this pipeline.
 
 ---
 
-### Processing — PySpark on AWS Glue
+### Processing — PySpark
 
 Both `batch_predict.py` and `monitor.py` are already structured as pure data transformation pipelines. The migration to PySpark is mechanical:
 
-**Batch scoring** (`score_batch.py` → Glue job):
+**Batch scoring** (`score_batch.py` → PySpark job):
 ```python
 # The normalize_feature_scale logic maps directly to a Pandas UDF
 @pandas_udf(DoubleType())
@@ -449,48 +427,46 @@ def normalize_and_score(batch_iter):
         scaled  = batch[FEATURE_COLUMNS].div(row_max, axis=0)
         yield pd.Series(model.predict_proba(scaled.astype("float64"))[:, 1])
 
-df = spark.read.parquet(f"s3://r2-churn-model/data/batches/features/{batch_id}/")
+df = spark.read.parquet(f"data/batches/features/{batch_id}/")
 predictions = df.withColumn("prediction_probability", normalize_and_score(*FEATURE_COLUMNS))
-predictions.write.parquet(f"s3://r2-churn-model/predictions/{batch_id}/")
+predictions.write.parquet(f"predictions/{batch_id}/")
 ```
 
-**Monitoring** (`monitor.py` → Glue job): PSI is computed using `approxQuantile` to build reference bin edges, then a `histogram` aggregation on the current batch. The result is the same JSON written to S3 instead of a local file. SHAP values are computed on a 500-row sample collected to the driver — this does not need to be distributed.
+**Monitoring** (`monitor.py` → PySpark job): PSI is computed using `approxQuantile` to build reference bin edges, then a `histogram` aggregation on the current batch. The result is the same JSON written to object storage instead of a local file. SHAP values are computed on a 500-row sample collected to the driver — this does not need to be distributed.
 
-**Training** (`train.py` → Glue or ECS task): XGBoost on 180 features and a dataset of this size trains comfortably on a single machine (a `m5.xlarge` ECS Fargate task completes training in seconds). Distributed training via `xgboost.spark.SparkXGBClassifier` is available if the dataset grows by orders of magnitude, but is unnecessary here. Keep it simple.
-
-AWS Glue is recommended over EMR for this workload: serverless (no cluster management), native S3 integration, and the jobs complete fast enough that the per-run cost is minimal.
+**Training** (`train.py` → container task): XGBoost on 180 features and a dataset of this size trains comfortably on a single machine. Distributed training via `xgboost.spark.SparkXGBClassifier` is available if the dataset grows by orders of magnitude, but is unnecessary here.
 
 ---
 
-### Orchestration — Apache Airflow on Amazon MWAA
+### Orchestration — Apache Airflow
 
 Two DAGs cover the full lifecycle:
 
-**`scoring_dag`** — triggered by an S3 event when a new batch file lands:
+**`scoring_dag`** — triggered by a storage event when a new batch file lands:
 
 ```
-S3 event: new batch
+New batch event
       │
       ▼
 validate_batch       # schema check, row count, null rate — fail fast
       │
       ▼
-score_batch          # Glue job: normalize + predict → S3 predictions/
+score_batch          # PySpark job: normalize + predict → predictions/
       │
       ▼
-run_monitoring       # Glue job: PSI, quality, perf → S3 monitoring/status/
+run_monitoring       # PySpark job: PSI, quality, perf → monitoring/status/
       │
       ▼
 check_status         # Python operator: read status JSON, branch on GREEN/AMBER/RED
       │
-      ├── GREEN ──► update_report    # regenerate champion_report.html → S3
+      ├── GREEN ──► update_report    # regenerate champion_report.html → storage
       │
       ├── AMBER ──► update_report
-      │             notify_amber     # SNS → Slack: "batch X is AMBER, reasons..."
+      │             notify_amber     # notification: "batch X is AMBER, reasons..."
       │
       └── RED ───► update_report
-                   flag_low_confidence   # tag batch as unreliable in Athena metadata
-                   notify_red            # SNS → PagerDuty: "batch X is RED — action required"
+                   flag_low_confidence   # tag batch as unreliable in data warehouse
+                   notify_red            # alert: "batch X is RED — action required"
                    trigger_retraining_dag
 ```
 
@@ -498,65 +474,57 @@ check_status         # Python operator: read status JSON, branch on GREEN/AMBER/
 
 ```
       ▼
-train_model          # Glue/ECS task: train.py → new churn_model vN in MLflow
+train_model          # container task: train.py → new churn_model vN in MLflow
       │
       ▼
-evaluate_model       # ECS task: evaluate.py → release_decision tag in MLflow
+evaluate_model       # container task: evaluate.py → release_decision tag in MLflow
       │
-      ├── APPROVED ──► notify_human   # SNS: "v{N} approved — promote to @champion in MLflow"
+      ├── APPROVED ──► notify_human   # notification: "v{N} approved — promote to @champion in MLflow"
       │
-      └── REJECTED ──► notify_human   # SNS: "v{N} rejected: {reasons}"
+      └── REJECTED ──► notify_human   # notification: "v{N} rejected: {reasons}"
 ```
 
 Promotion to `@champion` remains a **human step** in the MLflow UI — the DAG never promotes automatically.
 
 ---
 
-### MLflow — ECS Fargate + RDS + S3
+### MLflow — Container Service + Relational Database + Object Storage
 
 ```bash
-# docker-compose.yml → ECS task definition
 mlflow server \
-  --backend-store-uri postgresql://user:pass@rds-host:5432/mlflow \
-  --artifacts-destination s3://r2-churn-model/mlflow-artifacts \
+  --backend-store-uri postgresql://user:pass@db-host:5432/mlflow \
+  --artifacts-destination storage://mlflow-artifacts \
   --serve-artifacts \
   --host 0.0.0.0 --port 5000
 ```
 
-Deploy the MLflow server as an ECS Fargate service behind an internal Application Load Balancer — accessible within the VPC by Airflow workers, Glue jobs, and the data science team's machines (via VPN or AWS Client VPN). No public internet exposure needed.
+Deploy the MLflow server as a container service behind an internal load balancer — accessible within the network by Airflow workers, PySpark jobs, and the data science team (via VPN). No public internet exposure needed.
 
-All scripts already read `MLFLOW_TRACKING_URI` from an environment variable (`src/utils/config.py`), so no code changes are required — just update the environment variable in the ECS task definitions.
+All scripts already read `MLFLOW_TRACKING_URI` from an environment variable (`src/utils/config.py`), so no code changes are required — just update the environment variable in the container configuration.
 
 ---
 
 ### Monitoring Dashboard — Three Options
 
-#### Option A · Static HTML on S3 + CloudFront *(recommended for simplicity)*
+#### Option A · Static HTML on Object Storage + CDN *(recommended for simplicity)*
 
-The existing `champion_report.html` is already a fully self-contained, interactive Plotly report. After each `scoring_dag` run, the Airflow `update_report` task uploads the regenerated file to S3 and CloudFront invalidates its cache:
+The existing `champion_report.html` is already a fully self-contained, interactive Plotly report. After each `scoring_dag` run, the Airflow `update_report` task uploads the regenerated file to object storage and the CDN invalidates its cache. A pre-signed URL or IP allowlist gives the risk team access. Zero servers, zero maintenance, zero additional cost beyond storage. The report refreshes automatically after every batch.
 
-```python
-s3.upload_file("champion_report.html", "r2-churn-model", "monitoring/reports/champion_report.html")
-cloudfront.create_invalidation(DistributionId="...", Paths={"Quantity": 1, "Items": ["/monitoring/reports/*"]})
-```
+#### Option B · Streamlit *(good for internal teams)*
 
-A pre-signed URL or a CloudFront distribution with IP allowlist gives the risk team access. Zero servers, zero maintenance, zero additional cost beyond S3 storage. The report refreshes automatically after every batch.
-
-#### Option B · Streamlit on ECS Fargate *(good for internal teams)*
-
-Build a Streamlit app that reads directly from S3 (`status.json` files and Parquet predictions) and from the MLflow tracking server. Deploy as an ECS Fargate service behind an internal Application Load Balancer with Cognito authentication. Requires one always-on Fargate task but gives a fully interactive, real-time UI without the static-refresh limitation of Option A.
+Build a Streamlit app that reads directly from object storage (status JSON files and Parquet predictions) and from the MLflow tracking server. Deploy as a container service behind an internal load balancer with authentication. Gives a fully interactive, real-time UI without the static-refresh limitation of Option A.
 
 #### Option C · Custom Frontend *(best UX, higher effort)*
 
-A React + FastAPI application reading from Athena and S3. The FastAPI backend exposes endpoints like `/api/batches`, `/api/batch/{id}/status`, `/api/trend` that query Athena for historical metrics and return JSON. The React frontend renders charts with Recharts or Plotly.js. Given current AI coding tools, a functional prototype of this can be produced in a day — Claude Code can generate the boilerplate from the API schema. This option makes the most sense once the stakeholder audience extends beyond the data science team.
+A React + FastAPI application reading from the data warehouse and object storage. The FastAPI backend exposes endpoints like `/api/batches`, `/api/batch/{id}/status`, `/api/trend` that query historical metrics and return JSON. The React frontend renders charts with Recharts or Plotly.js. Given current AI coding tools, a functional prototype of this can be produced in a day. This option makes the most sense once the stakeholder audience extends beyond the data science team.
 
 ---
 
-### Alerting — CloudWatch + SNS
+### Alerting
 
-Airflow publishes batch status to a CloudWatch custom metric namespace (`ChurnModel/BatchStatus`, dimension `batch_id`). A CloudWatch Alarm fires on any `RED` value and publishes to an SNS topic wired to:
+Airflow publishes batch status to a monitoring metric namespace. An alert fires on any `RED` value and publishes to a notification channel wired to:
 - **Email** — for the model owner
-- **Slack** — via AWS Chatbot, for the on-call team
+- **Slack** — for the on-call team
 - **PagerDuty** — for after-hours RED alerts that require immediate action
 
 AMBER alerts go to Slack only (informational). GREEN is silent unless a team member queries the dashboard.
@@ -569,10 +537,10 @@ The entire business logic layer is portable as-is:
 
 | POC component | Production equivalent |
 |---|---|
-| `src/utils/config.py` | same file, env vars injected by ECS/Glue |
+| `src/utils/config.py` | same file, env vars injected by container/job config |
 | `normalize_feature_scale()` | same function, wrapped in a Pandas UDF |
-| PSI / KS / status logic in `monitor.py` | same logic, runs on the Glue driver or in a UDF |
-| `_decide_release()` in `evaluate.py` | same function, runs in an ECS task |
+| PSI / KS / status logic in `monitor.py` | same logic, runs on the PySpark driver or in a UDF |
+| `_decide_release()` in `evaluate.py` | same function, runs in a container task |
 | MLflow experiment tracking | same API calls, different tracking URI |
 | `@champion` alias promotion | same manual step in the same MLflow UI |
 
