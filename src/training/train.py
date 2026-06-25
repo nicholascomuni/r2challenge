@@ -5,8 +5,11 @@ Usage:
 """
 
 import sys
+import time
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import mlflow
 import mlflow.xgboost
@@ -69,7 +72,7 @@ def load_and_validate_data() -> tuple[pd.DataFrame, pd.Series]:
     return features[FEATURE_COLUMNS], target[LABEL_COLUMN].astype(int)
 
 
-def plot_feature_importance(model: XGBClassifier, feature_names: list[str], output_path: Path) -> Path:
+def plot_feature_importance(model: XGBClassifier, feature_names: list[str], output_path: Path) -> dict:
     importances = model.feature_importances_
     top_n = 20
     order = importances.argsort()[::-1][:top_n]
@@ -79,9 +82,9 @@ def plot_feature_importance(model: XGBClassifier, feature_names: list[str], outp
     plt.xlabel("Feature importance (gain)")
     plt.title(f"Top {top_n} features - churn_model")
     plt.tight_layout()
-    plt.savefig(output_path)
+    plt.savefig(output_path, dpi=120, bbox_inches="tight")
     plt.close()
-    return output_path
+    return dict(zip(feature_names, importances.tolist()))
 
 
 def main():
@@ -97,8 +100,10 @@ def main():
     mlflow.set_experiment(EXPERIMENT_NAME)
 
     with mlflow.start_run(run_name="xgboost_baseline") as run:
+        train_start = time.perf_counter()
         model = XGBClassifier(**MODEL_PARAMS)
         model.fit(X_train, y_train)
+        training_time = time.perf_counter() - train_start
 
         y_pred_proba = model.predict_proba(X_test)[:, 1]
         y_pred = (y_pred_proba >= 0.5).astype(int)
@@ -108,6 +113,7 @@ def main():
         recall = recall_score(y_test, y_pred, zero_division=0)
 
         print(f"AUC={auc:.4f}  Precision={precision:.4f}  Recall={recall:.4f}")
+        print(f"Training time: {training_time:.2f}s")
 
         mlflow.log_params(MODEL_PARAMS)
         mlflow.log_param("test_size", TEST_SIZE)
@@ -116,10 +122,14 @@ def main():
         mlflow.log_metric("auc", auc)
         mlflow.log_metric("precision", precision)
         mlflow.log_metric("recall", recall)
+        mlflow.log_metric("training_time_seconds", round(training_time, 2))
 
         importance_plot_path = TRAINING_DIR / "feature_importance.png"
-        plot_feature_importance(model, FEATURE_COLUMNS, importance_plot_path)
-        mlflow.log_artifact(str(importance_plot_path))
+        importance_dict = plot_feature_importance(model, FEATURE_COLUMNS, importance_plot_path)
+        mlflow.log_artifact(str(importance_plot_path), artifact_path="plots")
+
+        top20_importance = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)[:20]
+        mlflow.log_metrics({f"feat_imp_{name}": round(val, 6) for name, val in top20_importance})
 
         model_info = mlflow.xgboost.log_model(
             model,

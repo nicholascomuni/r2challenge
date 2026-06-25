@@ -21,9 +21,18 @@ TRAINING_DIR = REPORTS_DIR / "training"
 # MLflow
 # Defaults to local file-based tracking (no server required). Set MLFLOW_TRACKING_URI
 # (e.g. http://localhost:5000) to point at the docker-compose MLflow server instead.
-MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", f"file:///{(PROJECT_ROOT / 'mlruns').as_posix()}")
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000")
 EXPERIMENT_NAME = "churn_model_training"
+INFERENCE_EXPERIMENT = "churn_model_inference"
+EVALUATION_EXPERIMENT = "churn_model_evaluation"
 REGISTERED_MODEL_NAME = "churn_model"
+
+# Release gate thresholds (evaluation on labeled batch data)
+EVAL_AUC_MIN = 0.70
+EVAL_PRECISION_MIN = 0.50
+EVAL_RECALL_MIN = 0.40
+TRAIN_TIME_MAX_SECONDS = 300.0   # reject if training run took longer than 5 minutes
+INFERENCE_MS_PER_ROW_MAX = 10.0  # reject if average batch scoring exceeds 10 ms/row
 
 # Feature schema
 FEATURE_COLUMNS = [f"C{i}" for i in range(1, 181)]

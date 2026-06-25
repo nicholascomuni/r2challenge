@@ -1,6 +1,6 @@
 services:
   mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.17.2
+    image: ghcr.io/mlflow/mlflow:v3.14.0
     container_name: churn_mlflow
     ports:
       - "5000:5000"
@@ -9,6 +9,27 @@ services:
     command: >
       mlflow server
       --backend-store-uri sqlite:////mlruns/mlflow.db
-      --default-artifact-root /mlruns
+      --artifacts-destination /mlruns/artifacts
+      --serve-artifacts
       --host 0.0.0.0
       --port 5000
+      --allowed-hosts "*"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  app:
+    build: .
+    volumes:
+      - ./src:/app/src
+      - ./real_data:/app/real_data:ro
+      - ./reports:/app/reports
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    command: python -m src.training.train
+    depends_on:
+      mlflow:
+        condition: service_healthy
