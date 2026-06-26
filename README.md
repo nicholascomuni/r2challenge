@@ -347,8 +347,6 @@ Result on the held-out test split: **AUC ≈ 0.815, Precision ≈ 0.64, Recall �
 
 The POC scripts contain all the business logic that matters — feature normalization, PSI computation, release gates, status rules. Moving to production means swapping the local runtime for managed services; **the logic itself does not change**.
 
-### Target architecture
-
 ```
                         ┌──────────────────────────────────────────────────────┐
                         │                   Production                          │
@@ -387,161 +385,12 @@ The POC scripts contain all the business logic that matters — feature normaliz
                         └──────────────────────────────────────────────────────┘
 ```
 
----
-
-### Storage — Object Storage + Data Warehouse + Relational Database
-
-**Object storage** is the single source of truth for all data and outputs:
-
-```
-data-lake/
-├── data/
-│   ├── train/                      # features_train.parquet, target_train.parquet
-│   ├── batches/features/           # incoming batch files (partitioned by date)
-│   └── batches/labels/             # ground truth (arrives after predictions)
-├── predictions/                    # <batch_id>_predictions.parquet + metadata.json
-├── monitoring/
-│   ├── status/                     # <batch_id>_status.json
-│   └── reports/                    # champion_report.html (served via CDN)
-└── mlflow-artifacts/               # MLflow artifact store (models, plots)
-```
-
-**Data warehouse** sits on top of object storage as a serverless query layer. Parquet files in `predictions/` are immediately queryable for trend analysis ("what was the mean risk score and batch status over the last 90 days?"). Monitoring JSON files can be catalogued for SQL access. Pay-per-query, zero infrastructure to maintain.
-
-**Relational database** serves as the MLflow backend store (replacing the local SQLite file). A small instance is sufficient for the experiment tracking load of this pipeline.
-
----
-
-### Processing — PySpark
-
-Both `batch_predict.py` and `monitor.py` are already structured as pure data transformation pipelines. The migration to PySpark is mechanical:
-
-**Batch scoring** (`score_batch.py` → PySpark job):
-```python
-# The normalize_feature_scale logic maps directly to a Pandas UDF
-@pandas_udf(DoubleType())
-def normalize_and_score(batch_iter):
-    model = broadcast_model.value          # model broadcast to all workers
-    for batch in batch_iter:
-        row_max = batch[FEATURE_COLUMNS].max(axis=1).replace(0, 1)
-        scaled  = batch[FEATURE_COLUMNS].div(row_max, axis=0)
-        yield pd.Series(model.predict_proba(scaled.astype("float64"))[:, 1])
-
-df = spark.read.parquet(f"data/batches/features/{batch_id}/")
-predictions = df.withColumn("prediction_probability", normalize_and_score(*FEATURE_COLUMNS))
-predictions.write.parquet(f"predictions/{batch_id}/")
-```
-
-**Monitoring** (`monitor.py` → PySpark job): PSI is computed using `approxQuantile` to build reference bin edges, then a `histogram` aggregation on the current batch. The result is the same JSON written to object storage instead of a local file. SHAP values are computed on a 500-row sample collected to the driver — this does not need to be distributed.
-
-**Training** (`train.py` → container task): XGBoost on 180 features and a dataset of this size trains comfortably on a single machine. Distributed training via `xgboost.spark.SparkXGBClassifier` is available if the dataset grows by orders of magnitude, but is unnecessary here.
-
----
-
-### Orchestration — Apache Airflow
-
-Two DAGs cover the full lifecycle:
-
-**`scoring_dag`** — triggered by a storage event when a new batch file lands:
-
-```
-New batch event
-      │
-      ▼
-validate_batch       # schema check, row count, null rate — fail fast
-      │
-      ▼
-score_batch          # PySpark job: normalize + predict → predictions/
-      │
-      ▼
-run_monitoring       # PySpark job: PSI, quality, perf → monitoring/status/
-      │
-      ▼
-check_status         # Python operator: read status JSON, branch on GREEN/AMBER/RED
-      │
-      ├── GREEN ──► update_report    # regenerate champion_report.html → storage
-      │
-      ├── AMBER ──► update_report
-      │             notify_amber     # notification: "batch X is AMBER, reasons..."
-      │
-      └── RED ───► update_report
-                   flag_low_confidence   # tag batch as unreliable in data warehouse
-                   notify_red            # alert: "batch X is RED — action required"
-                   trigger_retraining_dag
-```
-
-**`retraining_dag`** — triggered manually or by `scoring_dag` on RED:
-
-```
-      ▼
-train_model          # container task: train.py → new churn_model vN in MLflow
-      │
-      ▼
-evaluate_model       # container task: evaluate.py → release_decision tag in MLflow
-      │
-      ├── APPROVED ──► notify_human   # notification: "v{N} approved — promote to @champion in MLflow"
-      │
-      └── REJECTED ──► notify_human   # notification: "v{N} rejected: {reasons}"
-```
-
-Promotion to `@champion` remains a **human step** in the MLflow UI — the DAG never promotes automatically.
-
----
-
-### MLflow — Container Service + Relational Database + Object Storage
-
-```bash
-mlflow server \
-  --backend-store-uri postgresql://user:pass@db-host:5432/mlflow \
-  --artifacts-destination storage://mlflow-artifacts \
-  --serve-artifacts \
-  --host 0.0.0.0 --port 5000
-```
-
-Deploy the MLflow server as a container service behind an internal load balancer — accessible within the network by Airflow workers, PySpark jobs, and the data science team (via VPN). No public internet exposure needed.
-
-All scripts already read `MLFLOW_TRACKING_URI` from an environment variable (`src/utils/config.py`), so no code changes are required — just update the environment variable in the container configuration.
-
----
+Batch files land in **object storage** (data lake), the single source of truth for inputs and outputs. **Airflow** orchestrates two DAGs: `scoring_dag` triggers on each new batch arrival (validate → PySpark score → monitor → alert) and `retraining_dag` runs on demand or when a RED status is detected. **PySpark** handles scoring and drift computation, with the same normalization logic wrapped in a Pandas UDF. **MLflow** runs as a container service backed by a relational database and object storage — all scripts already read `MLFLOW_TRACKING_URI` from an environment variable, so no code changes are required. A **data warehouse** sits on top of object storage for ad-hoc SQL queries over predictions and status history. Alerts fire on any RED batch to email, Slack, and PagerDuty; AMBER goes to Slack only. Promotion to `@champion` remains a **human step** in the MLflow UI in production as well.
 
 ### Monitoring Dashboard — Three Options
 
-#### Option A · Static HTML on Object Storage + CDN *(recommended for simplicity)*
+**Option A · Static HTML + CDN** *(recommended)* — The existing `champion_report.html` is already a fully self-contained Plotly report. Airflow uploads the regenerated file to object storage after each batch; a CDN serves it to the risk team with zero additional infrastructure.
 
-The existing `champion_report.html` is already a fully self-contained, interactive Plotly report. After each `scoring_dag` run, the Airflow `update_report` task uploads the regenerated file to object storage and the CDN invalidates its cache. A pre-signed URL or IP allowlist gives the risk team access. Zero servers, zero maintenance, zero additional cost beyond storage. The report refreshes automatically after every batch.
+**Option B · Jupyter Notebook** *(good for data science teams)* — A parameterized notebook reads directly from object storage (status JSON files, Parquet predictions) and the MLflow tracking server. Scheduled via Airflow with `papermill`, the executed notebook is saved as HTML and served alongside the Plotly report. Allows ad-hoc exploration without a separate web service.
 
-#### Option B · Streamlit *(good for internal teams)*
-
-Build a Streamlit app that reads directly from object storage (status JSON files and Parquet predictions) and from the MLflow tracking server. Deploy as a container service behind an internal load balancer with authentication. Gives a fully interactive, real-time UI without the static-refresh limitation of Option A.
-
-#### Option C · Custom Frontend *(best UX, higher effort)*
-
-A React + FastAPI application reading from the data warehouse and object storage. The FastAPI backend exposes endpoints like `/api/batches`, `/api/batch/{id}/status`, `/api/trend` that query historical metrics and return JSON. The React frontend renders charts with Recharts or Plotly.js. Given current AI coding tools, a functional prototype of this can be produced in a day. This option makes the most sense once the stakeholder audience extends beyond the data science team.
-
----
-
-### Alerting
-
-Airflow publishes batch status to a monitoring metric namespace. An alert fires on any `RED` value and publishes to a notification channel wired to:
-- **Email** — for the model owner
-- **Slack** — for the on-call team
-- **PagerDuty** — for after-hours RED alerts that require immediate action
-
-AMBER alerts go to Slack only (informational). GREEN is silent unless a team member queries the dashboard.
-
----
-
-### What does not change
-
-The entire business logic layer is portable as-is:
-
-| POC component | Production equivalent |
-|---|---|
-| `src/utils/config.py` | same file, env vars injected by container/job config |
-| `normalize_feature_scale()` | same function, wrapped in a Pandas UDF |
-| PSI / KS / status logic in `monitor.py` | same logic, runs on the PySpark driver or in a UDF |
-| `_decide_release()` in `evaluate.py` | same function, runs in a container task |
-| MLflow experiment tracking | same API calls, different tracking URI |
-| `@champion` alias promotion | same manual step in the same MLflow UI |
-
-The investment in a clean, well-abstracted POC pays off here: there is no rewrite, only a change in where and how each script runs.
+**Option C · Custom Frontend** *(best UX, higher effort)* — A React + FastAPI application querying the data warehouse and object storage. Given current AI coding tools, a functional prototype can be produced in a day. Makes the most sense once the stakeholder audience extends beyond the data science team.
